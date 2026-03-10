@@ -1,0 +1,198 @@
+# main.py
+# Minimal RAG Enterprise Knowledge Assistant (single-file prototype)
+# Requirements: fastapi, uvicorn, sentence-transformers, faiss-cpu, transformers, pypdf, aiofiles
+# Install: pip install fastapi uvicorn sentence-transformers faiss-cpu transformers pypdf aiofiles
+
+import os
+import io
+import json
+import glob
+import shutil
+from typing import List
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from pydantic import BaseModel
+from sentence_transformers import SentenceTransformer
+import faiss
+from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+from pypdf import PdfReader
+
+# Config (tune in production)
+DATA_DIR = "data_docs"
+INDEX_DIR = "index_store"
+EMBED_MODEL = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+LLM_MODEL = os.getenv("LLM_MODEL", "")  # set to a local HF model path for generation (optional)
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 200
+TOP_K = 5
+
+app = FastAPI(title="Enterprise RAG Assistant")
+embedder = SentenceTransformer(EMBED_MODEL)
+index = None
+metas = []  # list of dicts parallel to index ids
+llm_generator = None
+
+def ensure_dirs():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(INDEX_DIR, exist_ok=True)
+
+def read_pdf(path: str) -> str:
+    text = []
+    with open(path, "rb") as f:
+        reader = PdfReader(f)
+        for p in reader.pages:
+            txt = p.extract_text()
+            if txt:
+                text.append(txt)
+    return "\n".join(text)
+
+def read_txt(path: str) -> str:
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+def load_documents(folder: str) -> List[dict]:
+    docs = []
+    for path in glob.glob(os.path.join(folder, "**/*"), recursive=True):
+        if os.path.isdir(path): continue
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            if ext == ".pdf":
+                txt = read_pdf(path)
+            elif ext in [".txt", ".md"]:
+                txt = read_txt(path)
+            else:
+                continue
+            if txt.strip():
+                docs.append({"path": os.path.abspath(path), "text": txt})
+        except Exception:
+            continue
+    return docs
+
+def chunk_text(text: str, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    chunks = []
+    start = 0
+    length = len(text)
+    while start < length:
+        end = min(start + size, length)
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        start += size - overlap
+    return chunks
+
+def build_index(docs: List[dict]):
+    global index, metas
+    texts = []
+    metas = []
+    for d in docs:
+        chunks = chunk_text(d["text"])
+        for i, c in enumerate(chunks):
+            texts.append(c)
+            metas.append({"source": d["path"], "chunk_id": i})
+    if not texts:
+        raise RuntimeError("No text to index")
+    embeddings = embedder.encode(texts, show_progress_bar=True, convert_to_numpy=True)
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatIP(dim)
+    # normalize for cosine similarity
+    faiss.normalize_L2(embeddings)
+    index.add(embeddings)
+    # persist
+    faiss.write_index(index, os.path.join(INDEX_DIR, "faiss.index"))
+    with open(os.path.join(INDEX_DIR, "metas.json"), "w", encoding="utf-8") as f:
+        json.dump(metas, f, ensure_ascii=False, indent=2)
+
+def load_index():
+    global index, metas
+    idx_path = os.path.join(INDEX_DIR, "faiss.index")
+    meta_path = os.path.join(INDEX_DIR, "metas.json")
+    if os.path.exists(idx_path) and os.path.exists(meta_path):
+        index = faiss.read_index(idx_path)
+        with open(meta_path, "r", encoding="utf-8") as f:
+            metas = json.load(f)
+
+def init_llm():
+    global llm_generator
+    if not LLM_MODEL:
+        return
+    # load tokenizer+model for local generation
+    tok = AutoTokenizer.from_pretrained(LLM_MODEL, use_fast=True)
+    model = AutoModelForCausalLM.from_pretrained(LLM_MODEL, device_map="auto", torch_dtype="auto")
+    llm_generator = pipeline("text-generation", model=model, tokenizer=tok, max_new_tokens=300)
+
+class QueryIn(BaseModel):
+    q: str
+    k: int = TOP_K
+    use_generation: bool = True
+
+@app.on_event("startup")
+def startup():
+    ensure_dirs()
+    load_index()
+    init_llm()
+
+@app.post("/ingest")
+async def ingest(upload: UploadFile = File(...)):
+    ensure_dirs()
+    filename = upload.filename
+    dest = os.path.join(DATA_DIR, filename)
+    with open(dest, "wb") as f:
+        shutil.copyfileobj(upload.file, f)
+    # rebuild index from all docs
+    docs = load_documents(DATA_DIR)
+    try:
+        build_index(docs)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "ingested", "files": len(docs)}
+
+@app.post("/ingest-folder")
+async def ingest_folder():
+    ensure_dirs()
+    docs = load_documents(DATA_DIR)
+    if not docs:
+        raise HTTPException(status_code=400, detail="no documents found in data directory")
+    build_index(docs)
+    return {"status": "indexed", "documents": len(docs), "chunks": len(metas)}
+
+@app.post("/query")
+def query(body: QueryIn):
+    if index is None:
+        raise HTTPException(status_code=400, detail="index not built")
+    q_emb = embedder.encode([body.q], convert_to_numpy=True)
+    faiss.normalize_L2(q_emb)
+    D, I = index.search(q_emb, body.k)
+    results = []
+    for score, idx in zip(D[0], I[0]):
+        meta = metas[idx]
+        results.append({"score": float(score), "source": meta["source"], "chunk_id": meta["chunk_id"]})
+    # fetch chunk texts
+    retrieved_texts = []
+    for r in results:
+        p = r["source"]
+        try:
+            if p.lower().endswith(".pdf"):
+                full = read_pdf(p)
+            else:
+                full = read_txt(p)
+            chunks = chunk_text(full)
+            tidx = r["chunk_id"]
+            retrieved_texts.append(chunks[tidx] if tidx < len(chunks) else "")
+        except Exception:
+            retrieved_texts.append("")
+    assembled_context = "\n\n---\n\n".join(retrieved_texts)
+    if body.use_generation and llm_generator:
+        prompt = f"Use the provided enterprise documents to answer the question truthfully. If not found, say you don't know.\n\nContext:\n{assembled_context}\n\nQuestion: {body.q}\nAnswer:"
+        out = llm_generator(prompt, max_new_tokens=300, do_sample=False)[0]["generated_text"]
+        # trim prompt prefix if returned
+        answer = out[len(prompt):].strip() if out.startswith(prompt) else out.strip()
+        return {"answer": answer, "retrieved": results}
+    # fallback: return retrieved passages
+    return {"answer": None, "retrieved_passages": retrieved_texts, "retrieved": results}
+
+@app.get("/health")
+def health():
+    return {"ok": True, "index_built": index is not None}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
